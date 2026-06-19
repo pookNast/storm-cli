@@ -1,0 +1,19 @@
+services:
+  storm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: run
+    image: storm:latest
+    # Pass through all STORM_* env vars from host environment
+    environment:
+      - STORM_API_BASE=${STORM_API_BASE:-http://host.docker.internal:8400/v1}
+      - STORM_API_KEY=${STORM_API_KEY:-}
+      - STORM_MODEL=${STORM_MODEL:-glm-4.5-air}
+      - STORM_SYNTH_MODEL=${STORM_SYNTH_MODEL:-glm-5.1}
+      - STORM_TIMEOUT_SEC=${STORM_TIMEOUT_SEC:-60}
+    volumes:
+      # Mount local out/ so briefings are accessible on the host
+      - ./out:/out
+    # Default command — override on CLI: docker compose run storm research --topic "..."
+    command: ["--help"]
