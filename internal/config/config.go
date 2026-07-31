@@ -28,7 +28,7 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("config: STORM_API_BASE must be http/https with a host, got %q", base)
 	}
 
-	// Default tuned for local reasoning models (glm-5.1 etc.) under load.
+	// Default tuned for the local HiveMind gateway (glm-5.2) under concurrent load.
 	timeoutSec := 120
 	if raw := os.Getenv("STORM_TIMEOUT_SEC"); raw != "" {
 		n, err := strconv.Atoi(raw)
@@ -44,8 +44,13 @@ func Load() (Config, error) {
 	return Config{
 		APIBase:    base,
 		APIKey:     os.Getenv("STORM_API_KEY"),
-		Model:      envOr("STORM_MODEL", "glm-4.5-air"),
-		SynthModel: envOr("STORM_SYNTH_MODEL", "glm-5.1"),
+		// glm-5.2 is the HiveMind lead + lab R10 floor. The former defaults
+		// (glm-4.5-air, glm-5.1) are unsuitable for STORM's 5-way concurrent
+		// persona fan-out: glm-4.5-air is a slower reasoning model that bursts
+		// past the gateway rate limit / 120 s deadline, and glm-5.1 is silently
+		// aliased to glm-5.2 on :8400 and trips tight timeouts.
+		Model:      envOr("STORM_MODEL", "glm-5.2"),
+		SynthModel: envOr("STORM_SYNTH_MODEL", "glm-5.2"),
 		Timeout:    time.Duration(timeoutSec) * time.Second,
 	}, nil
 }

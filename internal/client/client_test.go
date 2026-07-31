@@ -179,3 +179,96 @@ func TestChat_ContextCancellation(t *testing.T) {
 		t.Fatal("expected error on context cancellation")
 	}
 }
+
+// TestChat_TimeoutRetries guards the fix for the 2026-07-30 STORM failure:
+// a single persona call stalled past the http.Client deadline and, because
+// timeouts were non-retryable, aborted the whole errgroup fan-out. Timeouts
+// must now be retried so a transient gateway stall is absorbed.
+func TestChat_TimeoutRetries(t *testing.T) {
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 2 {
+			// Stall past the 50 ms client timeout on the first attempt.
+			select {
+			case <-time.After(300 * time.Millisecond):
+			case <-r.Context().Done():
+			}
+			return // client already gave up; write nothing
+		}
+		resp := map[string]any{
+			"choices": []map[string]any{
+				{"message": map[string]any{"content": "recovered"}},
+			},
+		}
+		json.NewEncoder(w).Encode(resp) //nolint
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "", 50*time.Millisecond)
+	got, err := c.Chat(context.Background(), "m", "s", "u")
+	if err != nil {
+		t.Fatalf("Chat() should recover after a transient timeout: %v", err)
+	}
+	if got != "recovered" {
+		t.Errorf("got %q, want %q", got, "recovered")
+	}
+	if attempts < 2 {
+		t.Errorf("expected a retry after timeout, got %d attempt(s)", attempts)
+	}
+}
+
+// TestChat_429Retries guards the fix for the 2026-07-30 follow-on failure: once
+// timeouts retried, the persona fan-out burst past the gateway rate limit and a
+// 429 (previously non-retryable) aborted the run. 429 must now retry.
+func TestChat_429Retries(t *testing.T) {
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 2 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":{"code":"1302","message":"Rate limit reached for requests"}}`)) //nolint
+			return
+		}
+		resp := map[string]any{
+			"choices": []map[string]any{
+				{"message": map[string]any{"content": "recovered"}},
+			},
+		}
+		json.NewEncoder(w).Encode(resp) //nolint
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "", 5*time.Second)
+	got, err := c.Chat(context.Background(), "m", "s", "u")
+	if err != nil {
+		t.Fatalf("Chat() should recover after a 429: %v", err)
+	}
+	if got != "recovered" {
+		t.Errorf("got %q, want %q", got, "recovered")
+	}
+	if attempts < 2 {
+		t.Errorf("expected a retry after 429, got %d attempt(s)", attempts)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"5", 5 * time.Second},
+		{" 12 ", 12 * time.Second},
+		{"", 0},
+		{"0", 0},
+		{"-3", 0},
+		{"soon", 0},            // non-numeric -> 0
+		{"99999", 30 * time.Second}, // capped
+	}
+	for _, tc := range cases {
+		if got := parseRetryAfter(tc.in); got != tc.want {
+			t.Errorf("parseRetryAfter(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}

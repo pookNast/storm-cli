@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -51,20 +52,30 @@ type chatResponse struct {
 }
 
 // Chat sends a single system+user turn and returns the assistant's reply.
-// It retries once on 5xx or timeout errors with a short backoff.
-// ponytail: single fixed backoff — upgrade: exponential backoff if API becomes flaky.
+// It retries transient failures — 5xx, 429 rate limits, connection errors, and
+// timeouts — with a bounded exponential backoff (2 s, 4 s). Under concurrent
+// load the gateway can transiently stall past the client deadline or rate-limit
+// a burst, and a retry after backoff typically clears it. A parent-context
+// cancellation is still honoured: the backoff select returns immediately if ctx
+// is already done. A 429 Retry-After header (delta-seconds) overrides the
+// computed backoff when it asks for a longer wait.
 func (c *Client) Chat(ctx context.Context, model, systemPrompt, userPrompt string) (string, error) {
+	const maxAttempts = 3 // initial + 2 retries — absorbs a transient stall or rate burst
 	var (
 		result string
 		err    error
 	)
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			// ponytail: fixed 1 s backoff on retry — upgrade: exponential if latency variance grows.
+			backoff := time.Duration(1<<attempt) * time.Second // 2 s, then 4 s
+			var re *retryableError
+			if errors.As(err, &re) && re.retryAfter > backoff {
+				backoff = re.retryAfter
+			}
 			select {
 			case <-ctx.Done():
 				return "", fmt.Errorf("client: context cancelled before retry: %w", ctx.Err())
-			case <-time.After(time.Second):
+			case <-time.After(backoff):
 			}
 		}
 		result, err = c.doChat(ctx, model, systemPrompt, userPrompt)
@@ -101,12 +112,11 @@ func (c *Client) doChat(ctx context.Context, model, systemPrompt, userPrompt str
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		// A timeout means the server is slow — retrying only doubles the wall time,
-		// so surface it directly. Connection-level errors are retried once.
-		if ne, ok := err.(interface{ Timeout() bool }); ok && ne.Timeout() {
-			return "", fmt.Errorf("client: http do (timeout): %w", err)
-		}
-		return "", &retryableError{fmt.Errorf("client: http do: %w", err)}
+		// Retry transport errors including timeouts: under concurrent load the
+		// gateway can transiently stall past the http.Client deadline on a single
+		// request, and a retry usually clears it. A parent-context cancellation
+		// short-circuits the retry loop in Chat() via its ctx.Done() guard.
+		return "", &retryableError{cause: fmt.Errorf("client: http do: %w", err)}
 	}
 	defer resp.Body.Close()
 
@@ -115,8 +125,13 @@ func (c *Client) doChat(ctx context.Context, model, systemPrompt, userPrompt str
 		return "", fmt.Errorf("client: read body: %w", err)
 	}
 
-	if resp.StatusCode >= 500 {
-		return "", &retryableError{fmt.Errorf("client: server error %d: %s", resp.StatusCode, raw)}
+	// 429 (rate limit) and 5xx are transient — retry with backoff. A 429 may
+	// carry a Retry-After hint that Chat() honours when it exceeds the backoff.
+	if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+		return "", &retryableError{
+			cause:      fmt.Errorf("client: server status %d: %s", resp.StatusCode, raw),
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("client: unexpected status %d: %s", resp.StatusCode, raw)
@@ -132,8 +147,13 @@ func (c *Client) doChat(ctx context.Context, model, systemPrompt, userPrompt str
 	return cr.Choices[0].Message.Content, nil
 }
 
-// retryableError marks errors eligible for the single retry.
-type retryableError struct{ cause error }
+// retryableError marks errors eligible for retry. retryAfter, when non-zero,
+// carries a 429 Retry-After hint (delta-seconds) that overrides the computed
+// exponential backoff.
+type retryableError struct {
+	cause      error
+	retryAfter time.Duration
+}
 
 func (e *retryableError) Error() string { return e.cause.Error() }
 func (e *retryableError) Unwrap() error { return e.cause }
@@ -141,4 +161,24 @@ func (e *retryableError) Unwrap() error { return e.cause }
 func isRetryable(err error) bool {
 	var re *retryableError
 	return errors.As(err, &re)
+}
+
+// parseRetryAfter parses a Retry-After header in delta-seconds form into a
+// Duration, capped at 30 s so a huge value can't stall the run. Returns 0 on any
+// parse failure (the HTTP-date form is intentionally not supported).
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	const cap30 = 30 * time.Second
+	d := time.Duration(n) * time.Second
+	if d > cap30 {
+		return cap30
+	}
+	return d
 }

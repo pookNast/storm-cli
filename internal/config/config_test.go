@@ -16,10 +16,10 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.APIBase != "http://127.0.0.1:8400/v1" {
 		t.Errorf("APIBase = %q, want default", cfg.APIBase)
 	}
-	if cfg.Model != "glm-4.5-air" {
+	if cfg.Model != "glm-5.2" {
 		t.Errorf("Model = %q, want default", cfg.Model)
 	}
-	if cfg.SynthModel != "glm-5.1" {
+	if cfg.SynthModel != "glm-5.2" {
 		t.Errorf("SynthModel = %q, want default", cfg.SynthModel)
 	}
 	if cfg.Timeout != 120*time.Second {
